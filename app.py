@@ -21,19 +21,13 @@ sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 pending_reminder = {}
 
-# Фразы для "живости"
 PRAISE = [
-    "🎉 Отлично!",
-    "💪 Так держать!",
-    "🔥 Супер!",
-    "✨ Молодец!",
-    "👏 Класс!",
-    "🚀 Ты в деле!",
-]
-MISS_YOU = [
-    "Давно не виделись! Как успехи?",
-    "Привет! Соскучился. Готов отмечать?",
-    "С возвращением! Продолжим?",
+    "🎉 Отлично! Привычка отмечена.",
+    "💪 Так держать! Ещё один шаг к цели.",
+    "🔥 Супер! Ты справляешься.",
+    "✨ Молодец! Продолжай в том же духе.",
+    "👏 Класс! Привычка выполнена.",
+    "🚀 Ты в деле! Так и надо.",
 ]
 
 def now_msk():
@@ -44,6 +38,7 @@ def main_menu():
     kb.button(text="➕ Добавить привычку", callback_data="add_habit")
     kb.button(text="📋 Мои привычки", callback_data="my_habits")
     kb.button(text="📊 Статистика", callback_data="stats")
+    kb.button(text="🏆 Топ привычек", callback_data="top")
     kb.button(text="📤 Экспорт", callback_data="export")
     kb.button(text="⏰ Мои напоминания", callback_data="my_reminders")
     kb.adjust(1)
@@ -94,6 +89,7 @@ async def save_habit(message: types.Message):
         reply_markup=main_menu()
     )
 
+# === МОИ ПРИВЫЧКИ (с ❌/✅, процентом и датой) ===
 @dp.callback_query(F.data == "my_habits")
 async def my_habits(callback: types.CallbackQuery):
     res = sb.table("habits").select("id, name, remind_time").eq("user_id", callback.from_user.id).execute()
@@ -102,14 +98,42 @@ async def my_habits(callback: types.CallbackQuery):
         await edit_or_send(callback, "📭 У тебя пока нет привычек.\n\nДобавь первую — нажми «➕ Добавить привычку»", main_menu())
         await callback.answer()
         return
+
+    today = now_msk().date()
+    week_ago = today - timedelta(days=6)
     kb = InlineKeyboardBuilder()
+    done_count = 0
+    total = len(habits)
+
     for h in habits:
+        done_today = sb.table("completions").select("id").eq("habit_id", h["id"]).eq("done_date", today.isoformat()).execute()
+        is_done = bool(done_today.data)
+        if is_done:
+            done_count += 1
+        mark = "✅" if is_done else "❌"
         remind = f" ⏰{h['remind_time']}" if h.get("remind_time") else ""
-        kb.button(text=f"✅ {h['name']}{remind}", callback_data=f"done_{h['id']}")
-        kb.button(text="🗑 Удалить", callback_data=f"del_{h['id']}")
+        kb.button(text=f"{mark} {h['name']}{remind}", callback_data=f"done_{h['id']}")
+        kb.button(text="🗑", callback_data=f"del_{h['id']}")
     kb.button(text="🏠 Назад", callback_data="back_home")
     kb.adjust(2)
-    await edit_or_send(callback, "📋 Твои привычки. Нажми ✅, чтобы отметить выполнение:", kb.as_markup())
+
+    lines = [f"📋 Мои привычки ({done_count} из {total} выполнено сегодня)\n"]
+    for h in habits:
+        all_dates = sb.table("completions").select("done_date").eq("habit_id", h["id"]).execute().data
+        dates = [d["done_date"] for d in all_dates if d.get("done_date")]
+        week_dates = [d for d in dates if d >= week_ago.isoformat()]
+        week_count = len(week_dates)
+        percent = round(week_count / 7 * 100)
+        last = max(dates) if dates else "—"
+        done_today = sb.table("completions").select("id").eq("habit_id", h["id"]).eq("done_date", today.isoformat()).execute()
+        mark = "✅" if done_today.data else "❌"
+        lines.append(f"{mark} {h['name']}")
+        lines.append(f"   📅 За 7 дней: {week_count}/7 ({percent}%)")
+        lines.append(f"   🕐 Последнее: {last}")
+    lines.append("\nНажми на привычку, чтобы отметить.")
+    text = "\n".join(lines)
+
+    await edit_or_send(callback, text, kb.as_markup())
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("done_"))
@@ -120,13 +144,19 @@ async def mark_done(callback: types.CallbackQuery):
     if existing.data:
         await callback.answer("⚠️ Ты уже отмечал это сегодня!")
         return
+    habit = sb.table("habits").select("name").eq("id", habit_id).execute()
+    habit_name = habit.data[0]["name"] if habit.data else "Привычка"
     sb.table("completions").insert({
         "habit_id": habit_id,
         "user_id": callback.from_user.id,
         "date": today,
         "done_date": today
     }).execute()
-    await callback.answer(random.choice(PRAISE))
+    await callback.message.answer(
+        f"{random.choice(PRAISE)}\n\n"
+        f"«{habit_name}» — выполнено! Так держать 💪"
+    )
+    await callback.answer()
     await my_habits(callback)
 
 @dp.callback_query(F.data.startswith("del_"))
@@ -137,6 +167,7 @@ async def delete_habit(callback: types.CallbackQuery):
     await callback.answer("🗑 Привычка удалена.")
     await my_habits(callback)
 
+# === СТАТИСТИКА ===
 @dp.callback_query(F.data == "stats")
 async def stats(callback: types.CallbackQuery):
     res = sb.table("habits").select("id, name").eq("user_id", callback.from_user.id).execute()
@@ -145,29 +176,65 @@ async def stats(callback: types.CallbackQuery):
         await edit_or_send(callback, "📊 Пока нет данных. Добавь привычки и отмечай выполнение!", main_menu())
         await callback.answer()
         return
+    today = now_msk().date()
     text = "📊 Твоя статистика:\n\n"
     for h in habits:
         cnt = sb.table("completions").select("id", count="exact").eq("habit_id", h["id"]).execute()
-        dates = sb.table("completions").select("done_date").eq("habit_id", h["id"]).execute().data
+        all_dates = sb.table("completions").select("done_date").eq("habit_id", h["id"]).execute().data
+        dates = [d["done_date"] for d in all_dates if d.get("done_date")]
         streak = 0
         if dates:
-            days = sorted([d["done_date"] for d in dates if d.get("done_date")], reverse=True)
-            check = now_msk().date()
+            days = sorted(dates, reverse=True)
+            check = today
             for d in days:
                 if d == check.isoformat():
                     streak += 1
                     check -= timedelta(days=1)
                 else:
                     break
+        month_ago = today - timedelta(days=29)
+        month_count = len([d for d in dates if d >= month_ago.isoformat()])
+        month_percent = round(month_count / 30 * 100)
+        last = max(dates) if dates else "—"
         fire = "🔥" * min(streak, 5) if streak > 0 else ""
-        text += f"• {h['name']}: {cnt.count} раз, серия {streak} {fire}\n"
-    if any(d for h in habits for d in [h]):
-        text += "\n💡 Продолжай в том же духе!"
+        text += (
+            f"• {h['name']}\n"
+            f"   Всего: {cnt.count} раз\n"
+            f"   Серия: {streak} {fire}\n"
+            f"   За 30 дней: {month_percent}%\n"
+            f"   Последнее: {last}\n\n"
+        )
+    text += "💡 Продолжай в том же духе!"
     kb = InlineKeyboardBuilder()
     kb.button(text="🏠 Назад", callback_data="back_home")
     await edit_or_send(callback, text, kb.as_markup())
     await callback.answer()
 
+# === ТОП ПРИВЫЧЕК ===
+@dp.callback_query(F.data == "top")
+async def top(callback: types.CallbackQuery):
+    res = sb.table("habits").select("id, name").eq("user_id", callback.from_user.id).execute()
+    habits = res.data
+    if not habits:
+        await edit_or_send(callback, "🏆 Пока нет данных.", main_menu())
+        await callback.answer()
+        return
+    stats = []
+    for h in habits:
+        cnt = sb.table("completions").select("id", count="exact").eq("habit_id", h["id"]).execute()
+        stats.append((h["name"], cnt.count))
+    stats.sort(key=lambda x: x[1], reverse=True)
+    text = "🏆 Топ твоих привычек:\n\n"
+    medals = ["🥇", "🥈", "🥉"]
+    for i, (name, cnt) in enumerate(stats):
+        medal = medals[i] if i < 3 else f"{i+1}."
+        text += f"{medal} {name} — {cnt} раз\n"
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🏠 Назад", callback_data="back_home")
+    await edit_or_send(callback, text, kb.as_markup())
+    await callback.answer()
+
+# === ЭКСПОРТ ===
 @dp.callback_query(F.data == "export")
 async def export(callback: types.CallbackQuery):
     res = sb.table("habits").select("id, name").eq("user_id", callback.from_user.id).execute()
@@ -187,6 +254,7 @@ async def export(callback: types.CallbackQuery):
     await callback.message.answer_document(file, caption="📤 Вот твой экспорт!")
     await callback.answer()
 
+# === НАПОМИНАНИЯ ===
 @dp.callback_query(F.data == "my_reminders")
 async def my_reminders(callback: types.CallbackQuery):
     res = sb.table("habits").select("id, name, remind_time").eq("user_id", callback.from_user.id).execute()
