@@ -7,7 +7,6 @@ from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from supabase import create_client
 
-# === НАСТРОЙКИ ===
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
@@ -21,11 +20,11 @@ def main_menu():
     kb.button(text="➕ Добавить привычку", callback_data="add_habit")
     kb.button(text="📋 Мои привычки", callback_data="my_habits")
     kb.button(text="📊 Статистика", callback_data="stats")
+    kb.button(text="⏰ Настроить напоминание", callback_data="set_remind")
     kb.adjust(1)
     return kb.as_markup()
 
-async def edit_or_send(callback: types.CallbackQuery, text: str, kb=None):
-    """Редактирует текущее сообщение или отправляет новое."""
+async def edit_or_send(callback, text, kb=None):
     try:
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception:
@@ -33,6 +32,7 @@ async def edit_or_send(callback: types.CallbackQuery, text: str, kb=None):
 
 @dp.message(Command("start"))
 async def start(message: types.Message):
+    sb.table("users").upsert({"user_id": message.from_user.id}).execute()
     await message.answer("Привет! Я помогу отслеживать привычки.", reply_markup=main_menu())
 
 @dp.callback_query(F.data == "add_habit")
@@ -40,7 +40,7 @@ async def add_habit(callback: types.CallbackQuery):
     await edit_or_send(callback, "Напиши название привычки:")
     await callback.answer()
 
-@dp.message(F.text & ~F.text.startswith("/"))
+@dp.message(F.text & ~F.text.startswith("/") & ~F.text.regexp(r"^\d{2}:\d{2}$"))
 async def save_habit(message: types.Message):
     sb.table("habits").insert({
         "user_id": message.from_user.id,
@@ -73,7 +73,7 @@ async def mark_done(callback: types.CallbackQuery):
         "user_id": callback.from_user.id,
         "date": datetime.now().date().isoformat()
     }).execute()
-    await callback.answer("🎉 Отлично! Отмечено.")
+    await callback.answer("🎉 Отмечено!")
     await my_habits(callback)
 
 @dp.callback_query(F.data.startswith("del_"))
@@ -81,7 +81,7 @@ async def delete_habit(callback: types.CallbackQuery):
     habit_id = int(callback.data.split("_")[1])
     sb.table("completions").delete().eq("habit_id", habit_id).execute()
     sb.table("habits").delete().eq("id", habit_id).execute()
-    await callback.answer("🗑 Привычка удалена.")
+    await callback.answer("🗑 Удалено.")
     await my_habits(callback)
 
 @dp.callback_query(F.data == "stats")
@@ -89,10 +89,10 @@ async def stats(callback: types.CallbackQuery):
     res = sb.table("habits").select("id, name").eq("user_id", callback.from_user.id).execute()
     habits = res.data
     if not habits:
-        await edit_or_send(callback, "Нет привычек для статистики.", main_menu())
+        await edit_or_send(callback, "Нет привычек.", main_menu())
         await callback.answer()
         return
-    text = "📊 Твоя статистика:\n\n"
+    text = "📊 Статистика:\n\n"
     for h in habits:
         cnt = sb.table("completions").select("id", count="exact").eq("habit_id", h["id"]).execute()
         text += f"• {h['name']}: {cnt.count} раз\n"
@@ -101,10 +101,41 @@ async def stats(callback: types.CallbackQuery):
     await edit_or_send(callback, text, kb.as_markup())
     await callback.answer()
 
+@dp.callback_query(F.data == "set_remind")
+async def set_remind(callback: types.CallbackQuery):
+    await edit_or_send(callback, "Напиши время напоминания в формате ЧЧ:ММ (например, 09:00):")
+    await callback.answer()
+
+@dp.message(F.text.regexp(r"^\d{2}:\d{2}$"))
+async def save_remind(message: types.Message):
+    sb.table("users").upsert({
+        "user_id": message.from_user.id,
+        "remind_time": message.text
+    }).execute()
+    await message.answer(f"⏰ Напоминание установлено на {message.text}", reply_markup=main_menu())
+
 @dp.callback_query(F.data == "back_home")
 async def back_home(callback: types.CallbackQuery):
     await edit_or_send(callback, "Главное меню:", main_menu())
     await callback.answer()
+
+# === НАПОМИНАНИЯ ===
+async def reminder_loop():
+    while True:
+        now = datetime.now().strftime("%H:%M")
+        try:
+            users = sb.table("users").select("user_id, remind_time").eq("remind_time", now).execute()
+            for u in users.data:
+                habits = sb.table("habits").select("name").eq("user_id", u["user_id"]).execute()
+                if habits.data:
+                    text = "⏰ Напоминание! Не забудь:\n" + "\n".join(f"• {h['name']}" for h in habits.data)
+                    try:
+                        await bot.send_message(u["user_id"], text)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        await asyncio.sleep(60)
 
 # === FLASK ===
 app = Flask(__name__)
@@ -115,6 +146,7 @@ def health():
     return "OK"
 
 async def run_bot():
+    asyncio.create_task(reminder_loop())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
