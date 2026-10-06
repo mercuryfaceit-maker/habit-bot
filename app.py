@@ -1,6 +1,6 @@
 import os
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -71,7 +71,7 @@ async def mark_done(callback: types.CallbackQuery):
     sb.table("completions").insert({
         "habit_id": habit_id,
         "user_id": callback.from_user.id,
-        "date": datetime.now().date().isoformat()
+        "date": (datetime.utcnow() + timedelta(hours=3)).date().isoformat()
     }).execute()
     await callback.answer("🎉 Отмечено!")
     await my_habits(callback)
@@ -103,7 +103,7 @@ async def stats(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "set_remind")
 async def set_remind(callback: types.CallbackQuery):
-    await edit_or_send(callback, "Напиши время напоминания в формате ЧЧ:ММ (например, 09:00):")
+    await edit_or_send(callback, "Напиши время напоминания в формате ЧЧ:ММ (по Минску):")
     await callback.answer()
 
 @dp.message(F.text.regexp(r"^\d{2}:\d{2}$"))
@@ -112,17 +112,17 @@ async def save_remind(message: types.Message):
         "user_id": message.from_user.id,
         "remind_time": message.text
     }).execute()
-    await message.answer(f"⏰ Напоминание установлено на {message.text}", reply_markup=main_menu())
+    await message.answer(f"⏰ Напоминание установлено на {message.text} (по Минску)", reply_markup=main_menu())
 
 @dp.callback_query(F.data == "back_home")
 async def back_home(callback: types.CallbackQuery):
     await edit_or_send(callback, "Главное меню:", main_menu())
     await callback.answer()
 
-# === НАПОМИНАНИЯ ===
+# === НАПОМИНАНИЯ (с поправкой на UTC+3) ===
 async def reminder_loop():
     while True:
-        now = datetime.now().strftime("%H:%M")
+        now = (datetime.utcnow() + timedelta(hours=3)).strftime("%H:%M")
         try:
             users = sb.table("users").select("user_id, remind_time").eq("remind_time", now).execute()
             for u in users.data:
