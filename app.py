@@ -10,10 +10,12 @@ from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import BufferedInputFile
 from supabase import create_client
+from collections import Counter
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -61,6 +63,42 @@ async def start(message: types.Message):
         reply_markup=main_menu()
     )
 
+# === АДМИН-ПАНЕЛЬ (надёжная версия) ===
+@dp.message(Command("admin"))
+async def admin_panel(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("🚫 У тебя нет доступа.")
+        return
+    try:
+        users = sb.table("users").select("user_id", count="exact").execute()
+        habits = sb.table("habits").select("id", count="exact").execute()
+        completions = sb.table("completions").select("id", count="exact").execute()
+
+        day_ago = (now_msk() - timedelta(days=1)).date().isoformat()
+        active = sb.table("completions").select("user_id").gte("done_date", day_ago).execute()
+        active_ids = set(c["user_id"] for c in active.data)
+
+        all_c = sb.table("completions").select("user_id").execute().data
+        counter = Counter(c["user_id"] for c in all_c)
+        top5 = counter.most_common(5)
+
+        text = (
+            "👑 Админ-панель\n\n"
+            f"👥 Пользователей: {users.count}\n"
+            f"📋 Привычек всего: {habits.count}\n"
+            f"✅ Отметок всего: {completions.count}\n"
+            f"🔥 Активных за 24ч: {len(active_ids)}\n\n"
+            "🏆 Топ-5 активных:\n"
+        )
+        medals = ["🥇", "🥈", "🥉"]
+        for i, (uid, cnt) in enumerate(top5):
+            medal = medals[i] if i < 3 else f"{i+1}."
+            text += f"{medal} ID {uid} — {cnt} отметок\n"
+
+        await message.answer(text)
+    except Exception as e:
+        await message.answer(f"⚠️ Ошибка в админке:\n{str(e)}")
+
 @dp.callback_query(F.data == "add_habit")
 async def add_habit(callback: types.CallbackQuery):
     await edit_or_send(callback, "✍️ Напиши название привычки.\nНапример: «Зарядка» или «Читать 10 страниц»")
@@ -82,6 +120,8 @@ async def save_time_for_habit(message: types.Message):
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def save_habit(message: types.Message):
+    if message.from_user.id in pending_reminder:
+        return
     sb.table("habits").insert({"user_id": message.from_user.id, "name": message.text}).execute()
     await message.answer(
         f"✅ Привычка «{message.text}» добавлена!\n\n"
@@ -89,7 +129,6 @@ async def save_habit(message: types.Message):
         reply_markup=main_menu()
     )
 
-# === МОИ ПРИВЫЧКИ (с ❌/✅, процентом и датой) ===
 @dp.callback_query(F.data == "my_habits")
 async def my_habits(callback: types.CallbackQuery):
     res = sb.table("habits").select("id, name, remind_time").eq("user_id", callback.from_user.id).execute()
@@ -167,7 +206,6 @@ async def delete_habit(callback: types.CallbackQuery):
     await callback.answer("🗑 Привычка удалена.")
     await my_habits(callback)
 
-# === СТАТИСТИКА ===
 @dp.callback_query(F.data == "stats")
 async def stats(callback: types.CallbackQuery):
     res = sb.table("habits").select("id, name").eq("user_id", callback.from_user.id).execute()
@@ -210,7 +248,6 @@ async def stats(callback: types.CallbackQuery):
     await edit_or_send(callback, text, kb.as_markup())
     await callback.answer()
 
-# === ТОП ПРИВЫЧЕК ===
 @dp.callback_query(F.data == "top")
 async def top(callback: types.CallbackQuery):
     res = sb.table("habits").select("id, name").eq("user_id", callback.from_user.id).execute()
@@ -234,7 +271,6 @@ async def top(callback: types.CallbackQuery):
     await edit_or_send(callback, text, kb.as_markup())
     await callback.answer()
 
-# === ЭКСПОРТ ===
 @dp.callback_query(F.data == "export")
 async def export(callback: types.CallbackQuery):
     res = sb.table("habits").select("id, name").eq("user_id", callback.from_user.id).execute()
@@ -254,7 +290,6 @@ async def export(callback: types.CallbackQuery):
     await callback.message.answer_document(file, caption="📤 Вот твой экспорт!")
     await callback.answer()
 
-# === НАПОМИНАНИЯ ===
 @dp.callback_query(F.data == "my_reminders")
 async def my_reminders(callback: types.CallbackQuery):
     res = sb.table("habits").select("id, name, remind_time").eq("user_id", callback.from_user.id).execute()
