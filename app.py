@@ -103,7 +103,7 @@ async def stats(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "set_remind")
 async def set_remind(callback: types.CallbackQuery):
-    await edit_or_send(callback, "Напиши время напоминания в формате ЧЧ:ММ (по Минску):")
+    await edit_or_send(callback, "Напиши время напоминания в формате ЧЧ:ММ (по МСК):")
     await callback.answer()
 
 @dp.message(F.text.regexp(r"^\d{2}:\d{2}$"))
@@ -112,7 +112,7 @@ async def save_remind(message: types.Message):
         "user_id": message.from_user.id,
         "remind_time": message.text
     }).execute()
-    await message.answer(f"⏰ Напоминание установлено на {message.text} (по Минску)", reply_markup=main_menu())
+    await message.answer(f"⏰ Напоминание установлено на {message.text} (по МСК)", reply_markup=main_menu())
 
 @dp.callback_query(F.data == "back_home")
 async def back_home(callback: types.CallbackQuery):
