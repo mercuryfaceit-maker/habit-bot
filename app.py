@@ -18,6 +18,9 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# Хранилище: user_id -> habit_id (какую привычку сейчас настраиваем)
+pending_reminder = {}
+
 def now_msk():
     return datetime.utcnow() + timedelta(hours=3)
 
@@ -46,13 +49,30 @@ async def start(message: types.Message):
         reply_markup=main_menu()
     )
 
-# === ДОБАВЛЕНИЕ ПРИВЫЧКИ ===
 @dp.callback_query(F.data == "add_habit")
 async def add_habit(callback: types.CallbackQuery):
     await edit_or_send(callback, "Напиши название привычки:")
     await callback.answer()
 
-@dp.message(F.text & ~F.text.startswith("/") & ~F.text.regexp(r"^\d{2}:\d{2}$"))
+# === УСТАНОВКА НАПОМИНАНИЯ (только время) ===
+@dp.message(F.text.regexp(r"^\d{2}:\d{2}$"))
+async def save_time_for_habit(message: types.Message):
+    user_id = message.from_user.id
+    if user_id not in pending_reminder:
+        # Пользователь не выбирал привычку — значит это название
+        sb.table("habits").insert({
+            "user_id": user_id,
+            "name": message.text
+        }).execute()
+        await message.answer(f"✅ Привычка «{message.text}» сохранена!", reply_markup=main_menu())
+        return
+    # Устанавливаем напоминание
+    habit_id = pending_reminder.pop(user_id)
+    sb.table("habits").update({"remind_time": message.text}).eq("id", habit_id).eq("user_id", user_id).execute()
+    await message.answer(f"⏰ Напоминание установлено на {message.text} (по МСК)", reply_markup=main_menu())
+
+# === ОБЫЧНЫЙ ТЕКСТ = НОВАЯ ПРИВЫЧКА ===
+@dp.message(F.text & ~F.text.startswith("/"))
 async def save_habit(message: types.Message):
     sb.table("habits").insert({
         "user_id": message.from_user.id,
@@ -64,7 +84,6 @@ async def save_habit(message: types.Message):
         reply_markup=main_menu()
     )
 
-# === МОИ ПРИВЫЧКИ ===
 @dp.callback_query(F.data == "my_habits")
 async def my_habits(callback: types.CallbackQuery):
     res = sb.table("habits").select("id, name, remind_time").eq("user_id", callback.from_user.id).execute()
@@ -83,7 +102,6 @@ async def my_habits(callback: types.CallbackQuery):
     await edit_or_send(callback, "Нажми, чтобы отметить. Или 🗑, чтобы удалить:", kb.as_markup())
     await callback.answer()
 
-# === ОТМЕТКА (с защитой от двойной) ===
 @dp.callback_query(F.data.startswith("done_"))
 async def mark_done(callback: types.CallbackQuery):
     habit_id = int(callback.data.split("_")[1])
@@ -101,7 +119,6 @@ async def mark_done(callback: types.CallbackQuery):
     await callback.answer("🎉 Отмечено!")
     await my_habits(callback)
 
-# === УДАЛЕНИЕ ===
 @dp.callback_query(F.data.startswith("del_"))
 async def delete_habit(callback: types.CallbackQuery):
     habit_id = int(callback.data.split("_")[1])
@@ -110,9 +127,8 @@ async def delete_habit(callback: types.CallbackQuery):
     await callback.answer("🗑 Удалено.")
     await my_habits(callback)
 
-# === СТАТИСТИКА С СЕРИЕЙ ===
-@dp.callback_query(F.data == "stats")
-async def stats(callback: types.CallbackQuery):
+@dp.callback («_query(F.data == "stats")
+15async def stats(callback: types.CallbackQuery):
     res = sb.table("habits").select("id, name").eq("user_id", callback.from_user.id).execute()
     habits = res.data
     if not habits:
@@ -126,8 +142,7 @@ async def stats(callback: types.CallbackQuery):
         streak = 0
         if dates:
             days = sorted([d["done_date"] for d in dates if d.get("done_date")], reverse=True)
-            today = now_msk().date()
-            check = today
+            check = now_msk().date()
             for d in days:
                 if d == check.isoformat():
                     streak += 1
@@ -140,7 +155,6 @@ async def stats(callback: types.CallbackQuery):
     await edit_or_send(callback, text, kb.as_markup())
     await callback.answer()
 
-# === ЭКСПОРТ ===
 @dp.callback_query(F.data == "export")
 async def export(callback: types.CallbackQuery):
     res = sb.table("habits").select("id, name").eq("user_id", callback.from_user.id).execute()
@@ -160,7 +174,6 @@ async def export(callback: types.CallbackQuery):
     await callback.message.answer_document(file)
     await callback.answer()
 
-# === НАПОМИНАНИЯ К КАЖДОЙ ПРИВЫЧКЕ ===
 @dp.callback_query(F.data == "my_reminders")
 async def my_reminders(callback: types.CallbackQuery):
     res = sb.table("habits").select("id, name, remind_time").eq("user_id", callback.from_user.id).execute()
@@ -175,30 +188,21 @@ async def my_reminders(callback: types.CallbackQuery):
         kb.button(text=f"⏰ {h['name']} — {remind}", callback_data=f"setr_{h['id']}")
     kb.button(text="🏠 Назад", callback_data="back_home")
     kb.adjust(1)
-    await edit_or_send(callback, "Выбери привычку, чтобы поставить/изменить напоминание:", kb.as_markup())
+    await edit_or_send(callback, "Выбери привычку:", kb.as_markup())
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("setr_"))
 async def set_reminder_for_habit(callback: types.CallbackQuery):
-    habit_id = callback.data.split("_")[1]
-    await callback.message.answer(f"Введи время для привычки (ЧЧ:ММ) и ID: `{habit_id}`\nНапример: `09:00 {habit_id}`")
+    habit_id = int(callback.data.split("_")[1])
+    pending_reminder[callback.from_user.id] = habit_id
+    await callback.message.answer("Введи время в формате ЧЧ:ММ (например, 09:00):")
     await callback.answer()
 
-@dp.message(F.text.regexp(r"^\d{2}:\d{2}\s+\d+$"))
-async def save_reminder_for_habit(message: types.Message):
-    parts = message.text.split()
-    time_str = parts[0]
-    habit_id = int(parts[1])
-    sb.table("habits").update({"remind_time": time_str}).eq("id", habit_id).eq("user_id", message.from_user.id).execute()
-    await message.answer(f"⏰ Напоминание для привычки установлено на {time_str} (по МСК)", reply_markup=main_menu())
-
-# === НАЗАД ===
 @dp.callback_query(F.data == "back_home")
 async def back_home(callback: types.CallbackQuery):
     await edit_or_send(callback, "Главное меню:", main_menu())
     await callback.answer()
 
-# === ЦИКЛ НАПОМИНАНИЙ ===
 async def reminder_loop():
     while True:
         now = now_msk().strftime("%H:%M")
@@ -214,7 +218,6 @@ async def reminder_loop():
             pass
         await asyncio.sleep(60)
 
-# === FLASK ===
 app = Flask(__name__)
 
 @app.route("/")
