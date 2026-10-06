@@ -1,10 +1,13 @@
 import os
 import asyncio
+import csv
+import io
 from datetime import datetime, timedelta
 from flask import Flask
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import BufferedInputFile
 from supabase import create_client
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -15,12 +18,16 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+def now_msk():
+    return datetime.utcnow() + timedelta(hours=3)
+
 def main_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="➕ Добавить привычку", callback_data="add_habit")
     kb.button(text="📋 Мои привычки", callback_data="my_habits")
     kb.button(text="📊 Статистика", callback_data="stats")
-    kb.button(text="⏰ Настроить напоминание", callback_data="set_remind")
+    kb.button(text="📤 Экспорт", callback_data="export")
+    kb.button(text="⏰ Мои напоминания", callback_data="my_reminders")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -33,8 +40,13 @@ async def edit_or_send(callback, text, kb=None):
 @dp.message(Command("start"))
 async def start(message: types.Message):
     sb.table("users").upsert({"user_id": message.from_user.id}).execute()
-    await message.answer("Привет! Я помогу отслеживать привычки.", reply_markup=main_menu())
+    await message.answer(
+        "Привет! Я помогу отслеживать привычки.\n\n"
+        "Добавляй привычки, ставь напоминания, следи за серией.",
+        reply_markup=main_menu()
+    )
 
+# === ДОБАВЛЕНИЕ ПРИВЫЧКИ ===
 @dp.callback_query(F.data == "add_habit")
 async def add_habit(callback: types.CallbackQuery):
     await edit_or_send(callback, "Напиши название привычки:")
@@ -46,11 +58,16 @@ async def save_habit(message: types.Message):
         "user_id": message.from_user.id,
         "name": message.text
     }).execute()
-    await message.answer(f"✅ Привычка «{message.text}» сохранена!", reply_markup=main_menu())
+    await message.answer(
+        f"✅ Привычка «{message.text}» сохранена!\n\n"
+        "Хочешь поставить напоминание? Открой «⏰ Мои напоминания».",
+        reply_markup=main_menu()
+    )
 
+# === МОИ ПРИВЫЧКИ ===
 @dp.callback_query(F.data == "my_habits")
 async def my_habits(callback: types.CallbackQuery):
-    res = sb.table("habits").select("id, name").eq("user_id", callback.from_user.id).execute()
+    res = sb.table("habits").select("id, name, remind_time").eq("user_id", callback.from_user.id).execute()
     habits = res.data
     if not habits:
         await edit_or_send(callback, "У тебя пока нет привычек.", main_menu())
@@ -58,24 +75,33 @@ async def my_habits(callback: types.CallbackQuery):
         return
     kb = InlineKeyboardBuilder()
     for h in habits:
-        kb.button(text=f"✅ {h['name']}", callback_data=f"done_{h['id']}")
+        remind = f" ⏰{h['remind_time']}" if h.get("remind_time") else ""
+        kb.button(text=f"✅ {h['name']}{remind}", callback_data=f"done_{h['id']}")
         kb.button(text="🗑", callback_data=f"del_{h['id']}")
     kb.button(text="🏠 Назад", callback_data="back_home")
     kb.adjust(2)
     await edit_or_send(callback, "Нажми, чтобы отметить. Или 🗑, чтобы удалить:", kb.as_markup())
     await callback.answer()
 
+# === ОТМЕТКА (с защитой от двойной) ===
 @dp.callback_query(F.data.startswith("done_"))
 async def mark_done(callback: types.CallbackQuery):
     habit_id = int(callback.data.split("_")[1])
+    today = now_msk().date().isoformat()
+    existing = sb.table("completions").select("id").eq("habit_id", habit_id).eq("done_date", today).execute()
+    if existing.data:
+        await callback.answer("⚠️ Уже отмечено сегодня!")
+        return
     sb.table("completions").insert({
         "habit_id": habit_id,
         "user_id": callback.from_user.id,
-        "date": (datetime.utcnow() + timedelta(hours=3)).date().isoformat()
+        "date": today,
+        "done_date": today
     }).execute()
     await callback.answer("🎉 Отмечено!")
     await my_habits(callback)
 
+# === УДАЛЕНИЕ ===
 @dp.callback_query(F.data.startswith("del_"))
 async def delete_habit(callback: types.CallbackQuery):
     habit_id = int(callback.data.split("_")[1])
@@ -84,6 +110,7 @@ async def delete_habit(callback: types.CallbackQuery):
     await callback.answer("🗑 Удалено.")
     await my_habits(callback)
 
+# === СТАТИСТИКА С СЕРИЕЙ ===
 @dp.callback_query(F.data == "stats")
 async def stats(callback: types.CallbackQuery):
     res = sb.table("habits").select("id, name").eq("user_id", callback.from_user.id).execute()
@@ -92,47 +119,97 @@ async def stats(callback: types.CallbackQuery):
         await edit_or_send(callback, "Нет привычек.", main_menu())
         await callback.answer()
         return
-    text = "📊 Статистика:\n\n"
+    text = "📊 Твоя статистика:\n\n"
     for h in habits:
         cnt = sb.table("completions").select("id", count="exact").eq("habit_id", h["id"]).execute()
-        text += f"• {h['name']}: {cnt.count} раз\n"
+        dates = sb.table("completions").select("done_date").eq("habit_id", h["id"]).execute().data
+        streak = 0
+        if dates:
+            days = sorted([d["done_date"] for d in dates if d.get("done_date")], reverse=True)
+            today = now_msk().date()
+            check = today
+            for d in days:
+                if d == check.isoformat():
+                    streak += 1
+                    check -= timedelta(days=1)
+                else:
+                    break
+        text += f"• {h['name']}: {cnt.count} раз, серия {streak} 🔥\n"
     kb = InlineKeyboardBuilder()
     kb.button(text="🏠 Назад", callback_data="back_home")
     await edit_or_send(callback, text, kb.as_markup())
     await callback.answer()
 
-@dp.callback_query(F.data == "set_remind")
-async def set_remind(callback: types.CallbackQuery):
-    await edit_or_send(callback, "Напиши время напоминания в формате ЧЧ:ММ (по МСК):")
+# === ЭКСПОРТ ===
+@dp.callback_query(F.data == "export")
+async def export(callback: types.CallbackQuery):
+    res = sb.table("habits").select("id, name").eq("user_id", callback.from_user.id).execute()
+    habits = res.data
+    if not habits:
+        await edit_or_send(callback, "Нет данных для экспорта.", main_menu())
+        await callback.answer()
+        return
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Привычка", "Дата"])
+    for h in habits:
+        dates = sb.table("completions").select("done_date").eq("habit_id", h["id"]).execute().data
+        for d in dates:
+            writer.writerow([h["name"], d.get("done_date", "")])
+    file = BufferedInputFile(output.getvalue().encode("utf-8"), filename="habits.csv")
+    await callback.message.answer_document(file)
     await callback.answer()
 
-@dp.message(F.text.regexp(r"^\d{2}:\d{2}$"))
-async def save_remind(message: types.Message):
-    sb.table("users").upsert({
-        "user_id": message.from_user.id,
-        "remind_time": message.text
-    }).execute()
-    await message.answer(f"⏰ Напоминание установлено на {message.text} (по МСК)", reply_markup=main_menu())
+# === НАПОМИНАНИЯ К КАЖДОЙ ПРИВЫЧКЕ ===
+@dp.callback_query(F.data == "my_reminders")
+async def my_reminders(callback: types.CallbackQuery):
+    res = sb.table("habits").select("id, name, remind_time").eq("user_id", callback.from_user.id).execute()
+    habits = res.data
+    if not habits:
+        await edit_or_send(callback, "Сначала добавь привычки.", main_menu())
+        await callback.answer()
+        return
+    kb = InlineKeyboardBuilder()
+    for h in habits:
+        remind = h.get("remind_time") or "нет"
+        kb.button(text=f"⏰ {h['name']} — {remind}", callback_data=f"setr_{h['id']}")
+    kb.button(text="🏠 Назад", callback_data="back_home")
+    kb.adjust(1)
+    await edit_or_send(callback, "Выбери привычку, чтобы поставить/изменить напоминание:", kb.as_markup())
+    await callback.answer()
 
+@dp.callback_query(F.data.startswith("setr_"))
+async def set_reminder_for_habit(callback: types.CallbackQuery):
+    habit_id = callback.data.split("_")[1]
+    await callback.message.answer(f"Введи время для привычки (ЧЧ:ММ) и ID: `{habit_id}`\nНапример: `09:00 {habit_id}`")
+    await callback.answer()
+
+@dp.message(F.text.regexp(r"^\d{2}:\d{2}\s+\d+$"))
+async def save_reminder_for_habit(message: types.Message):
+    parts = message.text.split()
+    time_str = parts[0]
+    habit_id = int(parts[1])
+    sb.table("habits").update({"remind_time": time_str}).eq("id", habit_id).eq("user_id", message.from_user.id).execute()
+    await message.answer(f"⏰ Напоминание для привычки установлено на {time_str} (по МСК)", reply_markup=main_menu())
+
+# === НАЗАД ===
 @dp.callback_query(F.data == "back_home")
 async def back_home(callback: types.CallbackQuery):
     await edit_or_send(callback, "Главное меню:", main_menu())
     await callback.answer()
 
-# === НАПОМИНАНИЯ (с поправкой на UTC+3) ===
+# === ЦИКЛ НАПОМИНАНИЙ ===
 async def reminder_loop():
     while True:
-        now = (datetime.utcnow() + timedelta(hours=3)).strftime("%H:%M")
+        now = now_msk().strftime("%H:%M")
         try:
-            users = sb.table("users").select("user_id, remind_time").eq("remind_time", now).execute()
-            for u in users.data:
-                habits = sb.table("habits").select("name").eq("user_id", u["user_id"]).execute()
-                if habits.data:
-                    text = "⏰ Напоминание! Не забудь:\n" + "\n".join(f"• {h['name']}" for h in habits.data)
-                    try:
-                        await bot.send_message(u["user_id"], text)
-                    except Exception:
-                        pass
+            habits = sb.table("habits").select("user_id, name, remind_time").eq("remind_time", now).execute()
+            for h in habits.data:
+                text = f"⏰ Напоминание: {h['name']}"
+                try:
+                    await bot.send_message(h["user_id"], text)
+                except Exception:
+                    pass
         except Exception:
             pass
         await asyncio.sleep(60)
