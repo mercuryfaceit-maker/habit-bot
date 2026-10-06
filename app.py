@@ -24,13 +24,20 @@ def main_menu():
     kb.adjust(1)
     return kb.as_markup()
 
+async def edit_or_send(callback: types.CallbackQuery, text: str, kb=None):
+    """Редактирует текущее сообщение или отправляет новое."""
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb)
+
 @dp.message(Command("start"))
 async def start(message: types.Message):
     await message.answer("Привет! Я помогу отслеживать привычки.", reply_markup=main_menu())
 
 @dp.callback_query(F.data == "add_habit")
 async def add_habit(callback: types.CallbackQuery):
-    await callback.message.answer("Напиши название привычки:")
+    await edit_or_send(callback, "Напиши название привычки:")
     await callback.answer()
 
 @dp.message(F.text & ~F.text.startswith("/"))
@@ -46,13 +53,16 @@ async def my_habits(callback: types.CallbackQuery):
     res = sb.table("habits").select("id, name").eq("user_id", callback.from_user.id).execute()
     habits = res.data
     if not habits:
-        await callback.message.answer("Нет привычек.", reply_markup=main_menu())
+        await edit_or_send(callback, "У тебя пока нет привычек.", main_menu())
+        await callback.answer()
         return
     kb = InlineKeyboardBuilder()
     for h in habits:
         kb.button(text=f"✅ {h['name']}", callback_data=f"done_{h['id']}")
-    kb.adjust(1)
-    await callback.message.answer("Нажми, чтобы отметить:", reply_markup=kb.as_markup())
+        kb.button(text="🗑", callback_data=f"del_{h['id']}")
+    kb.button(text="🏠 Назад", callback_data="back_home")
+    kb.adjust(2)
+    await edit_or_send(callback, "Нажми, чтобы отметить. Или 🗑, чтобы удалить:", kb.as_markup())
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("done_"))
@@ -63,18 +73,37 @@ async def mark_done(callback: types.CallbackQuery):
         "user_id": callback.from_user.id,
         "date": datetime.now().date().isoformat()
     }).execute()
-    await callback.message.answer("🎉 Отлично!", reply_markup=main_menu())
-    await callback.answer()
+    await callback.answer("🎉 Отлично! Отмечено.")
+    await my_habits(callback)
+
+@dp.callback_query(F.data.startswith("del_"))
+async def delete_habit(callback: types.CallbackQuery):
+    habit_id = int(callback.data.split("_")[1])
+    sb.table("completions").delete().eq("habit_id", habit_id).execute()
+    sb.table("habits").delete().eq("id", habit_id).execute()
+    await callback.answer("🗑 Привычка удалена.")
+    await my_habits(callback)
 
 @dp.callback_query(F.data == "stats")
 async def stats(callback: types.CallbackQuery):
     res = sb.table("habits").select("id, name").eq("user_id", callback.from_user.id).execute()
     habits = res.data
-    text = "📊 Статистика:\n\n"
+    if not habits:
+        await edit_or_send(callback, "Нет привычек для статистики.", main_menu())
+        await callback.answer()
+        return
+    text = "📊 Твоя статистика:\n\n"
     for h in habits:
         cnt = sb.table("completions").select("id", count="exact").eq("habit_id", h["id"]).execute()
         text += f"• {h['name']}: {cnt.count} раз\n"
-    await callback.message.answer(text, reply_markup=main_menu())
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🏠 Назад", callback_data="back_home")
+    await edit_or_send(callback, text, kb.as_markup())
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_home")
+async def back_home(callback: types.CallbackQuery):
+    await edit_or_send(callback, "Главное меню:", main_menu())
     await callback.answer()
 
 # === FLASK ===
